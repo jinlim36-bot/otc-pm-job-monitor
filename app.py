@@ -5,16 +5,9 @@ import pandas as pd
 import urllib.parse
 from datetime import datetime
 from playwright.sync_api import sync_playwright
-import subprocess
-
-# 클라우드 환경에서 Playwright 브라우저 자동 설치
-try:
-    subprocess.run(["playwright", "install", "chromium"], check=True)
-except Exception:
-    pass
 
 # ----------------------------------------------------
-# 1. 제약/OTC 도메인 특화 필터링 사전 및 로직
+# 1. 도메인 필터링 사전 및 로직
 # ----------------------------------------------------
 PHARMA_KEYWORDS = [
     "otc", "일반의약품", "일반약", "제약", "약품", "바이오", 
@@ -35,32 +28,29 @@ def filter_pharma_jobs(df: pd.DataFrame, use_filter: bool = True) -> pd.DataFram
 
     def is_target(row):
         corpus = f"{row.get('기업명', '')} {row.get('채용제목', '')} {row.get('지원조건', '')}".lower()
-        
-        # 1. 제외 키워드 포함 시 즉시 탈락
         for bad_kw in EXCLUDE_KEYWORDS:
             if bad_kw in corpus:
                 return False
-                
-        # 2. 제약/헬스케어 키워드 최소 1개 이상 포함 시 합격
         for good_kw in PHARMA_KEYWORDS:
             if good_kw in corpus:
                 return True
-                
         return False
 
     return df[df.apply(is_target, axis=1)].reset_index(drop=True)
 
 
 # ----------------------------------------------------
-# 2. 사람인 크롤러 (requests 기반 고속 처리)
+# 2. 사람인 크롤러 (requests 세션 재활용 최적화)
 # ----------------------------------------------------
 def crawl_saramin(keywords: list[str], sort: str = "최신순", max_pages: int = 1) -> list[dict]:
     results = []
     sort_code = "date" if sort == "최신순" else "relation"
-    headers = {
+    
+    session = requests.Session()
+    session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept-Language": "ko-KR,ko;q=0.9",
-    }
+    })
 
     for keyword in keywords:
         for page in range(1, max_pages + 1):
@@ -70,7 +60,7 @@ def crawl_saramin(keywords: list[str], sort: str = "최신순", max_pages: int =
                 f"&recruitSort={sort_code}&recruitPageCount=40"
             )
             try:
-                res = requests.get(url, headers=headers, timeout=8)
+                res = session.get(url, timeout=5)
                 soup = BeautifulSoup(res.text, "html.parser")
                 items = soup.select(".item_recruit")
 
@@ -101,9 +91,9 @@ def crawl_saramin(keywords: list[str], sort: str = "최신순", max_pages: int =
 
 
 # ----------------------------------------------------
-# 3. 잡코리아 크롤러 (Playwright 봇 탐지 우회 및 고유 식별자 파서)
+# 3. 잡코리아 크롤러 (초고속 리소스 차단 + 조기 종료 최적화)
 # ----------------------------------------------------
-def crawl_jobkorea(keywords: list[str], sort: str = "최신순", max_pages: int = 1) -> list[dict]:
+def crawl_jobkorea_fast(keywords: list[str], sort: str = "최신순", max_pages: int = 1) -> list[dict]:
     results = []
     ord_code = "2" if sort == "최신순" else "1"
 
@@ -113,18 +103,25 @@ def crawl_jobkorea(keywords: list[str], sort: str = "최신순", max_pages: int 
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
-                "--disable-infobars",
-                "--window-size=1920,1080",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",
             ]
         )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             locale="ko-KR",
-            timezone_id="Asia/Seoul",
         )
         page = context.new_page()
 
-        # webdriver 탐지 속성 무력화
+        # [최적화 1] 이미지, 미디어, 폰트, CSS 스타일시트 다운로드 전면 차단 (속도 대폭 상승)
+        def block_unnecessary_resources(route):
+            if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
+                route.abort()
+            else:
+                route.continue_()
+
+        page.route("**/*", block_unnecessary_resources)
         page.add_init_script("delete Object.getPrototypeOf(navigator).webdriver;")
 
         for keyword in keywords:
@@ -134,10 +131,12 @@ def crawl_jobkorea(keywords: list[str], sort: str = "최신순", max_pages: int 
                     f"stext={urllib.parse.quote(keyword)}&tabType=recruit&Page_No={page_num}&Ord={ord_code}"
                 )
                 try:
-                    page.goto(url, wait_until="networkidle", timeout=15000)
+                    # [최적화 2] networkidle(15초 대기) 대신 domcontentloaded 사용
+                    page.goto(url, wait_until="domcontentloaded", timeout=7000)
                     
+                    # [최적화 3] 공고 요소가 DOM에 올라오면 최대 3초만 기다리고 즉시 파싱 진행
                     try:
-                        page.wait_for_selector("a[href*='GI_Read']", timeout=5000)
+                        page.wait_for_selector("a[href*='GI_Read']", timeout=3000)
                     except Exception:
                         pass
 
@@ -197,101 +196,100 @@ def crawl_jobkorea(keywords: list[str], sort: str = "최신순", max_pages: int 
 
 
 # ----------------------------------------------------
-# 4. Streamlit 인터랙티브 웹 대시보드
+# 4. [최적화 4] 캐시 적용 통합 수집 파이프라인 (30분 캐시)
 # ----------------------------------------------------
-st.set_page_config(
-    page_title="제약 OTC PM 채용 모니터링", 
-    page_icon="💊", 
-    layout="wide"
-)
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_all_job_data(platforms_tuple: tuple, keywords_tuple: tuple, sort_order: str, pages_per_kw: int):
+    data = []
+    platforms = list(platforms_tuple)
+    keywords = list(keywords_tuple)
 
+    if "사람인" in platforms:
+        data.extend(crawl_saramin(keywords, sort=sort_order, max_pages=pages_per_kw))
+    if "잡코리아" in platforms:
+        data.extend(crawl_jobkorea_fast(keywords, sort=sort_order, max_pages=pages_per_kw))
+
+    return data
+
+
+# ----------------------------------------------------
+# 5. UI 대시보드
+# ----------------------------------------------------
+st.set_page_config(page_title="제약 OTC PM 채용 모니터링", page_icon="💊", layout="wide")
 st.title("💊 제약 OTC PM 통합 구인정보 대시보드")
-st.caption("사람인과 잡코리아의 최신 구인공고를 실시간 취합하고, 비제약 잡음을 자동으로 필터링합니다.")
+st.caption("초고속 리소스 필터링 및 동적 캐시가 적용된 모니터링 시스템입니다.")
 
 with st.sidebar:
-    st.header("🔍 검색 설정")
-    
+    st.header("🔍 검색 옵션")
     selected_keywords = st.multiselect(
-        "검색 키워드 (다중 선택)",
+        "검색 키워드",
         options=["OTC PM", "일반의약품 PM", "OTC 마케팅", "컨슈머헬스케어 PM", "제약 PM", "건기식 PM"],
-        default=["OTC PM", "일반의약품 PM", "OTC 마케팅"]
+        default=["OTC PM", "일반의약품 PM"]
     )
     custom_keyword = st.text_input("추가 직접 입력 (쉼표 구분)", placeholder="예: OTC BM, 컨슈머헬스")
     
-    platforms = st.multiselect("수집 대상 플랫폼", ["사람인", "잡코리아"], default=["사람인", "잡코리아"])
-    sort_order = st.radio("정렬 기준", ["최신순", "정확도순"], horizontal=True)
-    pages_per_kw = st.slider("키워드당 수집 페이지 수", 1, 3, 1)
+    platforms = st.multiselect("플랫폼", ["사람인", "잡코리아"], default=["사람인", "잡코리아"])
+    sort_order = st.radio("정렬 방식", ["최신순", "정확도순"], horizontal=True)
+    pages_per_kw = st.slider("키워드당 페이지 수", 1, 3, 1)
     
     st.divider()
-    st.subheader("🎯 도메인 정밀 필터링")
-    filter_pharma = st.toggle(
-        "제약/헬스케어 도메인만 보기", 
-        value=True, 
-        help="IT 기획자, 시공 PM, 게임 PM 등 제약과 무관한 공고를 자동으로 차단합니다."
-    )
+    st.subheader("🎯 도메인 필터")
+    filter_pharma = st.toggle("제약/바이오/OTC 도메인만 선별", value=True)
     
-    run_search = st.button("공고 검색 실행", type="primary", use_container_width=True)
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        run_search = st.button("공고 불러오기", type="primary", use_container_width=True)
+    with col_btn2:
+        clear_cache = st.button("캐시 초기화", use_container_width=True)
 
-# 검색 키워드 조합
+if clear_cache:
+    st.cache_data.clear()
+    st.toast("캐시가 초기화되었습니다. 최신 공고를 다시 긁어옵니다.")
+
 all_keywords = list(selected_keywords)
 if custom_keyword:
     all_keywords.extend([k.strip() for k in custom_keyword.split(",") if k.strip()])
 
-if run_search:
+if run_search or "cached_results" in st.session_state:
     if not all_keywords:
-        st.warning("최소 1개 이상의 키워드를 선택하거나 입력해 주세요.")
+        st.warning("키워드를 선택해 주세요.")
     else:
-        all_data = []
+        with st.spinner("최적화 엔진으로 공고를 고속 수집 중입니다..."):
+            # 캐싱을 위해 리스트를 불변 튜플로 전달
+            raw_data = fetch_all_job_data(tuple(platforms), tuple(all_keywords), sort_order, pages_per_kw)
+            st.session_state["cached_results"] = True
 
-        # 1. 사람인 수집
-        if "사람인" in platforms:
-            with st.spinner("사람인 공고 수집 중..."):
-                saramin_data = crawl_saramin(all_keywords, sort=sort_order, max_pages=pages_per_kw)
-                all_data.extend(saramin_data)
-
-        # 2. 잡코리아 수집
-        if "잡코리아" in platforms:
-            with st.spinner("잡코리아 브라우저 렌더링 및 공고 파싱 중... (수초 소요)"):
-                jobkorea_data = crawl_jobkorea(all_keywords, sort=sort_order, max_pages=pages_per_kw)
-                all_data.extend(jobkorea_data)
-
-        if all_data:
-            raw_df = pd.DataFrame(all_data)
+        if raw_data:
+            raw_df = pd.DataFrame(raw_data)
             raw_df = raw_df.drop_duplicates(subset=["기업명", "채용제목"]).reset_index(drop=True)
             
-            # 도메인 필터 적용
+            # 필터링 적용 (캐시 데이터 기반 즉각 필터링)
             df = filter_pharma_jobs(raw_df, use_filter=filter_pharma)
             excluded_count = len(raw_df) - len(df)
 
-            # 요약 지표 카드
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("최종 선별 공고", f"{len(df)}건")
             c2.metric("타 업종 차단", f"{excluded_count}건", delta=-excluded_count if excluded_count > 0 else 0)
-            c3.metric("사람인 공고", f"{len(df[df['플랫폼'] == '사람인'])}건")
-            c4.metric("잡코리아 공고", f"{len(df[df['플랫폼'] == '잡코리아'])}건")
+            c3.metric("사람인", f"{len(df[df['플랫폼'] == '사람인'])}건")
+            c4.metric("잡코리아", f"{len(df[df['플랫폼'] == '잡코리아'])}건")
 
-            # 테이블 렌더링
             st.dataframe(
                 df,
                 column_config={
-                    "링크": st.column_config.LinkColumn("공고 링크", display_text="공고 열기 ↗"),
+                    "링크": st.column_config.LinkColumn("바로가기", display_text="공고 열기 ↗"),
                     "채용제목": st.column_config.TextColumn("채용공고명", width="large"),
                     "지원조건": st.column_config.TextColumn("자격 요건", width="medium"),
-                    "기업명": st.column_config.TextColumn("기업명", width="small"),
-                    "마감일": st.column_config.TextColumn("마감일", width="small"),
                 },
                 use_container_width=True,
                 hide_index=True,
             )
 
-            # CSV 다운로드 (Excel 한글 깨짐 방지 utf-8-sig)
             csv_data = df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                label="📥 선별 공고 CSV 엑셀 다운로드",
+                label="📥 CSV 엑셀 다운로드",
                 data=csv_data,
-                file_name=f"제약_OTC_PM_채용공고_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                file_name=f"OTC_PM_공고_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                 mime="text/csv",
-                use_container_width=True
             )
         else:
             st.info("검색 조건에 일치하는 공고가 없습니다.")
