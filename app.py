@@ -5,6 +5,13 @@ import pandas as pd
 import urllib.parse
 from datetime import datetime
 from playwright.sync_api import sync_playwright
+import subprocess
+
+# 클라우드 환경에서 Playwright 브라우저 자동 설치
+try:
+    subprocess.run(["playwright", "install", "chromium"], check=True)
+except Exception:
+    pass
 
 # ----------------------------------------------------
 # 1. 제약/OTC 도메인 특화 필터링 사전 및 로직
