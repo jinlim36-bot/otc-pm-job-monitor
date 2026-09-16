@@ -12,3 +12,4 @@ __pycache__/
 Thumbs.db
 .vscode/
 .idea/
+git add packages.txt app.py
