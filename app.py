@@ -83,18 +83,32 @@ def extract_job_id(platform: str, url: str) -> str:
 # 2. 동적 D-Day 및 메타데이터(경력/지역) 파서
 # ----------------------------------------------------
 def parse_dday(date_str: str) -> tuple[str, int]:
-    """실행 시점의 시스템 날짜를 기준으로 동적 D-Day 산출"""
-    if not date_str or any(k in date_str for k in ["상시", "채용시", "수시"]):
+    """실행 시점의 시스템 날짜를 기준으로 동적 D-Day 산출 및 마감 공고 배제"""
+    if not date_str:
         return "상시채용", 999
-    if "오늘" in date_str:
+
+    clean_str = date_str.strip()
+
+    # 1. 텍스트 형태의 마감/종료 공고 최우선 감지 (음수 정렬값 부여)
+    if any(k in clean_str for k in ["어제마감", "어제"]):
+        return "마감종료 (어제)", -1
+
+    if any(k in clean_str for k in ["접수마감", "채용마감", "공고마감", "마감", "채용종료", "종료"]):
+        # '오늘마감', '상시채용' 등 정상 진행 키워드는 예외 처리
+        if not any(k in clean_str for k in ["오늘마감", "오늘", "상시", "수시", "채용시"]):
+            return "마감종료", -999
+
+    if any(k in clean_str for k in ["상시", "채용시", "수시"]):
+        return "상시채용", 999
+    if "오늘" in clean_str:
         return "오늘마감 (D-0)", 0
-    if "내일" in date_str:
+    if "내일" in clean_str:
         return "D-1", 1
 
     today = datetime.now().date()
 
-    # 1. YYYY-MM-DD 또는 YYYY.MM.DD
-    match_full = re.search(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})", date_str)
+    # 2. YYYY-MM-DD 또는 YYYY.MM.DD 형태
+    match_full = re.search(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})", clean_str)
     if match_full:
         try:
             target = date(int(match_full.group(1)), int(match_full.group(2)), int(match_full.group(3)))
@@ -103,22 +117,26 @@ def parse_dday(date_str: str) -> tuple[str, int]:
         except Exception:
             pass
 
-    # 2. MM/DD 형태 (현재 연도 기준 동적 롤오버)
-    match_short = re.search(r"(\d{1,2})/(\d{1,2})", date_str)
+    # 3. MM/DD 형태 (연말-연초 전환기만 내년으로 이월)
+    match_short = re.search(r"(\d{1,2})/(\d{1,2})", clean_str)
     if match_short:
         try:
             month = int(match_short.group(1))
             day = int(match_short.group(2))
-            target = date(today.year, month, day)
-            # 이미 지난 날짜면 다음 해로 보정 (예: 12월에 1월 공고 탐색)
-            if target < today:
+
+            # 현재가 연말(11~12월)이고 마감일이 연초(1~2월)인 경우에만 다음 해 적용
+            if today.month in [11, 12] and month in [1, 2]:
                 target = date(today.year + 1, month, day)
+            else:
+                target = date(today.year, month, day)
+
             diff = (target - today).days
             return (f"D-{diff}" if diff >= 0 else "마감종료"), diff
         except Exception:
             pass
 
-    return date_str, 500
+    # 파싱 실패한 불명확 문자열은 마감으로 간주하여 제외되도록 음수 처리
+    return clean_str, -999
 
 def parse_career_and_region(text: str) -> tuple[str, str]:
     """지원조건 문자열에서 경력 요건 및 근무지역 추출"""
