@@ -8,6 +8,18 @@ import json
 import os
 import hashlib
 from datetime import datetime, date
+import subprocess
+import sys
+
+# Streamlit Cloud 컨테이너 환경에서 Chromium 바이너리 자동 설치
+@st.cache_resource
+def ensure_playwright_browsers():
+    try:
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+    except Exception as e:
+        st.error(f"Playwright 설치 오류: {e}")
+
+ensure_playwright_browsers()
 
 
 # ----------------------------------------------------
