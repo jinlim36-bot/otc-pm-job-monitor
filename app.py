@@ -8,7 +8,7 @@ import json
 import os
 import hashlib
 from datetime import datetime, date
-from playwright.sync_api import sync_playwright
+
 
 # ----------------------------------------------------
 # 1. 파일 기반 영속성 저장소 (이력 및 관심공고)
@@ -332,77 +332,74 @@ def crawl_saramin(keywords: list[str], sort: str, max_pages: int, stats: dict) -
 def crawl_jobkorea(keywords: list[str], sort: str, max_pages: int, stats: dict) -> list[dict]:
     results = []
     ord_code = "2" if sort == "최신순" else "1"
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
+        "Referer": "https://www.jobkorea.co.kr/"
+    })
 
-    with sync_playwright() as p:
-        browser = None
-        try:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
-            )
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                locale="ko-KR"
-            )
-            page = context.new_page()
-            page.route("**/*", lambda r: r.abort() if r.request.resource_type in ["image", "media", "font", "stylesheet"] else r.continue_())
-            page.add_init_script("delete Object.getPrototypeOf(navigator).webdriver;")
+    for kw in keywords:
+        for page_num in range(1, max_pages + 1):
+            stats["jobkorea_req"] += 1
+            url = f"https://www.jobkorea.co.kr/Search/?stext={urllib.parse.quote(kw)}&tabType=recruit&Page_No={page_num}&Ord={ord_code}"
+            try:
+                res = session.get(url, timeout=8)
+                if res.status_code != 200:
+                    continue
 
-            for kw in keywords:
-                for page_num in range(1, max_pages + 1):
-                    stats["jobkorea_req"] += 1
-                    url = f"https://www.jobkorea.co.kr/Search/?stext={urllib.parse.quote(kw)}&tabType=recruit&Page_No={page_num}&Ord={ord_code}"
-                    try:
-                        page.goto(url, wait_until="domcontentloaded", timeout=9000)
-                        try:
-                            page.wait_for_selector("a[href*='GI_Read']", timeout=3000)
-                        except Exception:
-                            pass
+                soup = BeautifulSoup(res.text, "html.parser")
+                # 신규/구형 DOM 구조 대응 셀렉터
+                job_items = soup.select("article.list-item, li.list-post, div.list-item")
+                
+                # 대체 셀렉터 (링크 기반 역추적)
+                if not job_items:
+                    links = soup.select("a[href*='/Recruit/GI_Read/']")
+                    job_items = [a.find_parent(["article", "li", "div"]) for a in links if a.find_parent(["article", "li", "div"])]
 
-                        soup = BeautifulSoup(page.content(), "html.parser")
-                        job_links = soup.select("a[href*='/Recruit/GI_Read/']")
-                        stats["jobkorea_found"] += len(job_links)
+                # 중복 제거
+                job_items = list(dict.fromkeys(job_items))
+                stats["jobkorea_found"] += len(job_items)
 
-                        for a in job_links:
-                            title = a.get_text(strip=True)
-                            href = a.get("href", "")
-                            if not title or len(title) < 2:
-                                continue
+                for card in job_items:
+                    if not card:
+                        continue
+                    
+                    title_elem = card.select_one("a[href*='/Recruit/GI_Read/'], .information-title a")
+                    if not title_elem:
+                        continue
+                    
+                    title = title_elem.get_text(strip=True)
+                    href = title_elem.get("href", "")
+                    if not title or len(title) < 2 or not href:
+                        continue
 
-                            card = a.find_parent("article") or a.find_parent("li") or a.find_parent("div", class_="list-item")
-                            corp_name = "회사명 미기재"
-                            date_str = "상시채용"
-                            cond_str = ""
+                    corp_elem = card.select_one("a[href*='/Company/'], .name, .corp-name, .list-section-corp")
+                    corp_name = corp_elem.get_text(strip=True) if corp_elem else "회사명 미기재"
 
-                            if card:
-                                corp_elem = card.select_one("a[href*='/Company/'], .name, .corp-name, .list-section-corp")
-                                if corp_elem: corp_name = corp_elem.get_text(strip=True)
-                                date_elem = card.select_one(".date, .time")
-                                if date_elem: date_str = date_elem.get_text(strip=True)
-                                chips = card.select(".chip, .etc span, .desc span")
-                                if chips:
-                                    cond_str = " | ".join([c.get_text(strip=True) for c in chips if c.get_text(strip=True)])
+                    date_elem = card.select_one(".date, .time, .badge-date")
+                    date_str = date_elem.get_text(strip=True) if date_elem else "상시채용"
 
-                            full_link = f"https://www.jobkorea.co.kr{href}" if href.startswith("/") else href
-                            dday_str, dday_val = parse_dday(date_str)
+                    chips = card.select(".chip, .etc span, .desc span, .chip-information-item")
+                    cond_str = " | ".join([c.get_text(strip=True) for c in chips if c.get_text(strip=True)])
 
-                            results.append({
-                                "공고ID": extract_job_id("잡코리아", full_link),
-                                "플랫폼": "잡코리아",
-                                "검색키워드": kw,
-                                "기업명": corp_name,
-                                "채용제목": title,
-                                "지원조건": cond_str,
-                                "마감일": date_str,
-                                "D-day": dday_str,
-                                "dday_sort": dday_val,
-                                "링크": full_link,
-                            })
-                    except Exception as e:
-                        stats["errors"].append(f"잡코리아 [{kw} {page_num}p]: {str(e)}")
-        finally:
-            if browser:
-                browser.close()
+                    full_link = f"https://www.jobkorea.co.kr{href}" if href.startswith("/") else href
+                    dday_str, dday_val = parse_dday(date_str)
+
+                    results.append({
+                        "공고ID": extract_job_id("잡코리아", full_link),
+                        "플랫폼": "잡코리아",
+                        "검색키워드": kw,
+                        "기업명": corp_name,
+                        "채용제목": title,
+                        "지원조건": cond_str,
+                        "마감일": date_str,
+                        "D-day": dday_str,
+                        "dday_sort": dday_val,
+                        "링크": full_link,
+                    })
+            except Exception as e:
+                stats["errors"].append(f"잡코리아 [{kw} {page_num}p]: {str(e)}")
 
     return results
 
