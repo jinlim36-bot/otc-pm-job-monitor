@@ -10,7 +10,30 @@ import hashlib
 from datetime import datetime, date
 import subprocess
 import sys
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
+def get_jobkorea_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.jobkorea.co.kr/",
+        "Connection": "keep-alive"
+    })
+    
+    # 500대 에러 및 커넥션 에러에 대한 재시도 전략 설정
+    retries = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        raise_on_status=False
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+    return session
+    
 # ----------------------------------------------------
 # 1. 파일 기반 영속성 저장소 (이력 및 관심공고)
 # ----------------------------------------------------
