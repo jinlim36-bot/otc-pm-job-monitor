@@ -2,9 +2,8 @@ name: Keep Streamlit Alive
 
 on:
   schedule:
-    # 3일마다 자정(UTC 기준)에 실행
-    - cron: '0 0 */3 * *'
-  # GitHub 웹 화면에서 수동으로 테스트 실행 가능
+    # 6시간마다 실행 (하루 4회)
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 jobs:
@@ -26,7 +25,7 @@ jobs:
           python - << 'EOF'
           from playwright.sync_api import sync_playwright
 
-          APP_URL = "https://<본인-앱-주소>.streamlit.app"
+          APP_URL = "https://otc-pm-job-monitor.streamlit.app"
 
           with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
